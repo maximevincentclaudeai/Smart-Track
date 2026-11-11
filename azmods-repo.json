@@ -3,5 +3,27 @@
   "name": "SMART TRACK",
   "maintainer": "maximevincentclaudeai",
   "homepage": "https://github.com/maximevincentclaudeai/smart-track",
-  "mods": []
+  "mods": [
+    {
+      "id": "smart-track",
+      "name": "SMART TRACK",
+      "version": "0.1.0",
+      "author": "maximevincentclaudeai",
+      "summary": "Finds tracks that fit the playing track by BPM, compatible musical key and selected playlists.",
+      "icon": "https://github.com/maximevincentclaudeai/Smart-Track/releases/download/smart-track-0.1.0/smart-track-0.1.0-icon.png",
+      "package": "https://github.com/maximevincentclaudeai/Smart-Track/releases/download/smart-track-0.1.0/smart-track-0.1.0.azmod",
+      "sha256": "4af0d4c5d15fdb28d8c3171f0b2975aa21ba4f4e8ba111b5242123db260e4164",
+      "size": 76135,
+      "firmware": [
+        "any"
+      ],
+      "hooks": false,
+      "source": "https://github.com/maximevincentclaudeai/smart-track",
+      "updated": "2026-11-11",
+      "category": "tools",
+      "license": "GPL-3.0-only",
+      "min_core": "1.2.3",
+      "description": "Find tracks in the USB library that fit the playing track: BPM (including pitch-fader adjustment), Camelot-compatible key and selected playlists. SMART TRACK also suggests a name for your set. Configure filters in Mod Menu > SMART TRACK; settings are saved on the USB drive. The mod reads rekordbox library and deck state only. It uses no network and does not patch firmware."
+    }
+  ]
 }
