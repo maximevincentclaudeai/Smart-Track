@@ -2,7 +2,7 @@
   "azmod": 1,
   "id": "smart-track",
   "name": "Smart Track",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "author": "maximevincentclaudeai",
   "summary": "Touch the Tag List tab: tracks matching the playing track's BPM, key and playlists, plus a set name.",
   "description": "Touching the Tag List tab opens an overlay of tracks from your USB library that fit the playing track: BPM within a range (pitch included), key within +/-1 on the Camelot wheel, and the playlists you choose to watch (leave ALL out). The browse knob scrolls it. It proposes a set name such as House 124 BPM 8A.\n\nEach criterion can be switched off in Mod Menu > Smart Track and your choices are kept on the USB. First use: Calibrate Tag List tab, then touch the tab once. The mod only reads the library and deck state; no files, no network, no patches.",
