@@ -6,24 +6,24 @@
   "mods": [
     {
       "id": "smart-track",
-      "name": "SMART TRACK",
-      "version": "0.1.0",
+      "name": "Smart Track",
+      "version": "0.2.0",
       "author": "maximevincentclaudeai",
-      "summary": "Finds tracks that fit the playing track by BPM, compatible musical key and selected playlists.",
-      "icon": "https://github.com/maximevincentclaudeai/Smart-Track/releases/download/smart-track-0.1.0/smart-track-0.1.0-icon.png",
-      "package": "https://github.com/maximevincentclaudeai/Smart-Track/releases/download/smart-track-0.1.0/smart-track-0.1.0.azmod",
-      "sha256": "4af0d4c5d15fdb28d8c3171f0b2975aa21ba4f4e8ba111b5242123db260e4164",
-      "size": 76135,
+      "summary": "Touch the Tag List tab: tracks matching the playing track's BPM, key and playlists, plus a set name.",
+      "icon": "https://github.com/maximevincentclaudeai/Smart-Track/releases/download/smart-track-0.2.0/smart-track-0.2.0-icon.png",
+      "package": "https://github.com/maximevincentclaudeai/Smart-Track/releases/download/smart-track-0.2.0/smart-track-0.2.0.azmod",
+      "sha256": "ee3441da3fbaf9e930d93e861361ba45ff3262e73fd64c8cfa82eb744171d023",
+      "size": 85326,
       "firmware": [
         "any"
       ],
       "hooks": false,
       "source": "https://github.com/maximevincentclaudeai/smart-track",
-      "updated": "2026-11-11",
+      "updated": "2026-11-12",
       "category": "tools",
       "license": "GPL-3.0-only",
       "min_core": "1.2.3",
-      "description": "Find tracks in the USB library that fit the playing track: BPM (including pitch-fader adjustment), Camelot-compatible key and selected playlists. SMART TRACK also suggests a name for your set. Configure filters in Mod Menu > SMART TRACK; settings are saved on the USB drive. The mod reads rekordbox library and deck state only. It uses no network and does not patch firmware."
+      "description": "Touching the Tag List tab opens an overlay of tracks from your USB library that fit the playing track: BPM within a range (pitch included), key within +/-1 on the Camelot wheel, and the playlists you choose to watch (leave ALL out). The browse knob scrolls it. It proposes a set name such as House 124 BPM 8A.\n\nEach criterion can be switched off in Mod Menu > Smart Track and your choices are kept on the USB. First use: Calibrate Tag List tab, then touch the tab once. The mod only reads the library and deck state; no files, no network, no patches."
     }
   ]
 }
