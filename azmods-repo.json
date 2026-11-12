@@ -7,13 +7,13 @@
     {
       "id": "smart-track",
       "name": "Smart Track",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "author": "maximevincentclaudeai",
       "summary": "Touch the Tag List tab: tracks matching the playing track's BPM, key and playlists, plus a set name.",
-      "icon": "https://github.com/maximevincentclaudeai/Smart-Track/releases/download/smart-track-0.2.1/smart-track-0.2.1-icon.png",
-      "package": "https://github.com/maximevincentclaudeai/Smart-Track/releases/download/smart-track-0.2.1/smart-track-0.2.1.azmod",
-      "sha256": "1dc854372d040550ca3804eef0000e4ed87167676fb5eef77133aae8af53841e",
-      "size": 89998,
+      "icon": "https://github.com/maximevincentclaudeai/Smart-Track/releases/download/smart-track-0.3.0/smart-track-0.3.0-icon.png",
+      "package": "https://github.com/maximevincentclaudeai/Smart-Track/releases/download/smart-track-0.3.0/smart-track-0.3.0.azmod",
+      "sha256": "e5a6c43c7965fc77e0be929604ea3805887824c6c9e5335bceed3448ed5b3f79",
+      "size": 94798,
       "firmware": [
         "any"
       ],
