@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-only
  *
- * smart-track: a "smart" Tag List for the XDJ-AZ.
+ * smart-track: a "smart" track suggester for the XDJ-AZ.
  *
  * While you browse, a SMART button sits on the Browse screen. Tap it and an overlay lists the
  * tracks of your library that fit the track that is playing:
@@ -28,21 +28,14 @@
 #include "azmod-mod.h"
 
 #define MOD_ID "smart-track"
-#define MOD_VERSION "0.3.0"
+#define MOD_VERSION "0.5.1"
 
 /* ---- layout (screen is 1280x800) ---------------------------------------------------------
- * The SDK cannot tell the Tag List tab from the Playlist tab (both are AZ_VIEW_BROWSE) and does
- * not say where EP147 draws its tabs. So the DJ calibrates once (Mod Menu > Smart Track >
- * Calibrate Tag List tab: tap the tab) and a touch filter, which sees touches before EP147,
- * opens the overlay when that tab is touched. The SMART button below is the fallback. */
+ * The SMART button sits at the top right of Browse and opens the overlay. */
 #define CHIP_X 1040
 #define CHIP_Y 6
 #define CHIP_W 232
 #define CHIP_H 44
-#define CAL_X 816            /* the SET TAG LIST TAB button, left of the SMART button */
-#define CAL_Y 6
-#define CAL_W 216
-#define CAL_H 44
 #define SCREEN_W 1280
 #define SCREEN_H 800
 
@@ -62,6 +55,7 @@ typedef struct {
     uint32_t id;
     uint8_t stick, key;      /* key: Camelot code, n*2 + (major ? 1 : 0), 0 = unknown */
     uint16_t pad;
+    uint32_t ord;            /* position in the stick's own track list */
     float bpm;
     uint64_t pl;             /* bit i = in playlist g_names[i] */
     char title[56];
@@ -71,7 +65,8 @@ typedef struct {
 typedef struct {
     char title[56], artist[40], pl[24], key[4];
     float bpm;
-    unsigned char same_key;
+    uint32_t id;             /* rekordbox id: the link back to the library */
+    unsigned char same_key, stick;
 } res_t;
 
 enum { ST_IDLE = 0, ST_SCAN, ST_NOLIB, ST_NOTRACK, ST_OK };
@@ -110,11 +105,14 @@ static long s_nolib_ms;
 static int a_pending, a_rescan, a_last_play = -1, a_want_scan;
 static long a_now_ms;                         /* the UI thread's clock, for the worker */
 static int a_active, a_sel;                  /* overlay open; selected row */
-static int a_calib, a_calib_done, a_req;     /* calibration; touch filter -> tick: 1 open, 2 close */
-static int a_tab_x = -1, a_tab_y = -1;       /* the Tag List tab's touch point, -1 = not calibrated */
-static int a_tab_on, a_hw = 100;             /* open from the tab; half width of its touch zone */
-static long a_calib_t, a_pk_ms;
-static int a_ticks, a_touch_n, a_touch_x, a_touch_y, a_touch_view = -1;   /* the HUD's facts */
+static long a_pk_ms;
+/* Select in library: the UI asks (a_goto_*), the worker plans, the mixer filter turns EP147's browse
+ * knob (a_inj_*). a_cur is where we believe EP147's list cursor is (a_cur_valid: we can trust it). */
+static int a_goto_req, a_goto_stick, a_goto_id;
+static int a_inj_up, a_inj_dn, a_inj_per = 1, a_inj_full;
+static int a_cur, a_cur_valid, a_cur_ctx = -1;
+static int g_filter_ok;
+static int a_ticks;                          /* the status strip's facts */
 /* Painter -> input geometry (screen pixels). */
 static int a_row_y0, a_row_h, a_vis, a_top;
 /* The overlay's second page (playlists to watch) and its touch zones. */
@@ -125,13 +123,14 @@ static int a_gut_x, a_gut_w;                    /* the UP / DN buttons (w = 0: n
 
 /* UI-thread-only. */
 static int h_bpm = -1, h_bpm_rng = -1, h_key = -1, h_key_mode = -1, h_pl = -1;
-static int h_diag = -1, h_deck = -1, h_usb = -1, h_overlay = -1, h_otop = -1, h_open = -1, h_tabw = -1;
+static int h_diag = -1, h_deck = -1, h_usb = -1, h_overlay = -1, h_otop = -1;
+static int h_goto = -1, h_order = -1, h_speed = -1;
 static int a_focus;
-static az_surface *ov, *chip, *hud, *cal;
+static az_surface *ov, *chip, *hud;
 static long last_tick_ms;
 static unsigned last_sig = 0xFFFFFFFFu;
-static int seen_ver = -1, last_top = -1, last_chip = -1, last_hud = -1, last_cal = -1, last_cal_sig = -1,
-    banner_done;
+static int seen_ver = -1, last_top = -1, last_chip = -1, last_hud = -1, banner_done;
+static int hud_force_off;                    /* the strip's HIDE button, if the row could not be set */
 static unsigned last_hud_sig = 0xFFFFFFFFu;
 
 static void st_lock(void)
@@ -357,7 +356,7 @@ static void st_watch_save(void)     /* UI thread */
 }
 
 /* ---- the library scan (worker thread only) ---------------------------------------------- */
-typedef struct { int stick; int bit; } scan_ctx;
+typedef struct { int stick; int bit; int n; } scan_ctx;
 typedef struct { int stick, id, folder; char name[PL_NAME]; } plent;
 static plent s_pl[160];
 static int s_npl;
@@ -405,6 +404,7 @@ static int cb_all(const az_track *t, void *u)
     trk_t *k = &s_tracks[s_ntracks++];
     memset(k, 0, sizeof *k);
     k->id = t->id;
+    k->ord = (uint32_t) c->n++;
     k->stick = (uint8_t) c->stick;
     double b = t->bpm;
     k->bpm = (b > 0.0 && b < 1000.0) ? (float) b : 0.0f;
@@ -471,7 +471,7 @@ static void job_scan(void)
     s_npl = 0;
 
     for (int stick = 0; stick < 2; stick++) {
-        scan_ctx c = { stick, 0 };
+        scan_ctx c = { stick, 0, 0 };
         C->lib_tracks(MOD_ID, stick, 0, cb_all, &c);
     }
     if (s_ntracks == 0) {
@@ -485,14 +485,14 @@ static void job_scan(void)
     st_sort(s_tracks, s_ntracks);
 
     for (int stick = 0; stick < 2; stick++) {
-        scan_ctx c = { stick, 0 };
+        scan_ctx c = { stick, 0, 0 };
         C->lib_playlists(MOD_ID, stick, cb_pl_list, &c);
     }
     for (int i = 0; i < s_npl; i++) {
         if (s_pl[i].folder || !s_pl[i].name[0]) continue;
         int slot = name_slot(s_pl[i].name);
         if (slot < 0) continue;
-        scan_ctx c = { s_pl[i].stick, slot };
+        scan_ctx c = { s_pl[i].stick, slot, 0 };
         C->lib_tracks(MOD_ID, s_pl[i].stick, s_pl[i].id, cb_pl_tracks, &c);
     }
 
@@ -659,6 +659,8 @@ static void job_match(void)
         st_copy(r->title, sizeof r->title, tk->title);
         st_copy(r->artist, sizeof r->artist, tk->artist);
         r->bpm = tk->bpm;
+        r->id = tk->id;
+        r->stick = tk->stick;
         st_key_str(tk->key, r->key);
         r->same_key = (unsigned char) (cur_key && tk->key == cur_key);
         uint64_t show = tk->pl & wm;
@@ -713,6 +715,76 @@ static void job_match(void)
     st_publish(&cx, res, nr);
 }
 
+/* ---- Select in library (worker thread only) ---------------------------------------------- */
+static int st_icmp(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        unsigned char x = (unsigned char) *a, y = (unsigned char) *b;
+        if (x >= 'A' && x <= 'Z') x = (unsigned char) (x + 32);
+        if (y >= 'A' && y <= 'Z') y = (unsigned char) (y + 32);
+        if (x != y) return x < y ? -1 : 1;
+    }
+    return (*a ? 1 : 0) - (*b ? 1 : 0);
+}
+
+/* The order of EP147's track list: 0 title A-Z, 1 artist A-Z, 2 as the stick lists them. */
+static int trk_order(const trk_t *a, const trk_t *b, int order)
+{
+    int c = 0;
+    if (order == 2) return a->ord < b->ord ? -1 : (a->ord > b->ord ? 1 : 0);
+    if (order == 1) {
+        c = st_icmp(a->artist, b->artist);
+        if (!c) c = st_icmp(a->title, b->title);
+    } else {
+        c = st_icmp(a->title, b->title);
+    }
+    if (c) return c;
+    return a->id < b->id ? -1 : (a->id > b->id ? 1 : 0);
+}
+
+static void job_goto(void)
+{
+    const uint32_t id = (uint32_t) __atomic_load_n(&a_goto_id, __ATOMIC_ACQUIRE);
+    const int stick = __atomic_load_n(&a_goto_stick, __ATOMIC_ACQUIRE);
+    if (!s_scanned) return;
+    int order = st_row(h_order, 0);
+    if (order < 0 || order > 2) order = 0;
+
+    const trk_t *t = NULL;
+    for (int i = 0; i < s_ntracks; i++)
+        if (s_tracks[i].id == id && s_tracks[i].stick == stick) { t = &s_tracks[i]; break; }
+    if (!t) {
+        C->log(MOD_ID, "select in library: track %u not in the index", (unsigned) id);
+        return;
+    }
+    int idx = 0, n = 0;
+    for (int i = 0; i < s_ntracks; i++) {
+        if (s_tracks[i].stick != stick) continue;
+        n++;
+        if (trk_order(&s_tracks[i], t, order) < 0) idx++;
+    }
+
+    const int ctx = stick * 8 + order;
+    __atomic_store_n(&a_inj_up, 0, __ATOMIC_RELEASE);         /* a move still running is replaced */
+    __atomic_store_n(&a_inj_dn, 0, __ATOMIC_RELEASE);
+    int up = 0, dn = 0;
+    if (__atomic_load_n(&a_cur_valid, __ATOMIC_ACQUIRE) && __atomic_load_n(&a_cur_ctx, __ATOMIC_RELAXED) == ctx) {
+        int rel = idx - __atomic_load_n(&a_cur, __ATOMIC_RELAXED);      /* from where the list is now */
+        if (rel >= 0) dn = rel;
+        else up = -rel;
+    } else {
+        __atomic_store_n(&a_cur_valid, 0, __ATOMIC_RELEASE);          /* from the top of the list */
+        __atomic_store_n(&a_cur_ctx, ctx, __ATOMIC_RELAXED);
+        __atomic_store_n(&a_inj_full, 1, __ATOMIC_RELEASE);
+        up = n + 3;
+        dn = idx;
+    }
+    C->log(MOD_ID, "select in library: \"%s\" is #%d of %d (order %d): up %d, down %d", t->title, idx + 1, n,
+           order, up, dn);
+    __atomic_store_n(&a_inj_dn, dn, __ATOMIC_RELEASE);
+    __atomic_store_n(&a_inj_up, up, __ATOMIC_RELEASE);
+}
+
 /* ---- the job thread -------------------------------------------------------------------- */
 /* One thread, started in init(). It sleeps 100 ms at a time until the UI thread asks for a job
  * (a_pending), so when nothing is open it costs next to nothing. */
@@ -720,6 +792,7 @@ static void *worker(void *arg)
 {
     (void) arg;
     for (;;) {
+        if (__atomic_exchange_n(&a_goto_req, 0, __ATOMIC_SEQ_CST)) job_goto();
         if (__atomic_exchange_n(&a_pending, 0, __ATOMIC_SEQ_CST)) {
             if (!s_scanned || __atomic_exchange_n(&a_rescan, 0, __ATOMIC_SEQ_CST)) job_scan();
             job_match();
@@ -774,30 +847,76 @@ static void fitted_in(az_draw *d, int x, int y, int h, const char *s, int px, ui
     draw_fitted(d, x, y + (h - px * 3 / 2) / 2, s, px, col, w);
 }
 
-/* A small label box: filled when on, outlined and dim when off. Returns its width. */
-static int pill(az_draw *d, int x, int y, int h, const char *s, int px, int on, uint32_t hi, uint32_t hit,
-                uint32_t dim)
+/* ---- look: light, blue and rounded, in the style of iOS ---------------------------------- */
+typedef struct { uint32_t bg, card, text, dim, blue, on_blue, sep; } pal_t;
+
+static pal_t get_pal(void)
+{
+    if (AZ_HAS(C, ui_theme) && C->ui_theme() == 1)          /* the deck's Day theme */
+        return (pal_t) { 0xF2F2F7, 0xFFFFFF, 0x1C1C1E, 0x8E8E93, 0x007AFF, 0xFFFFFF, 0xD1D1D6 };
+    return (pal_t) { 0x1C1C1E, 0x2C2C2E, 0xFFFFFF, 0x98989F, 0x0A84FF, 0xFFFFFF, 0x3A3A3C };
+}
+
+static int isqrt_i(int v)
+{
+    int r = 0;
+    while ((r + 1) * (r + 1) <= v) r++;
+    return r;
+}
+
+/* A filled rectangle with round corners (strips: the core has no rounded primitive). */
+static void rrect(az_draw *d, int x, int y, int w, int h, int r, uint32_t col)
+{
+    if (w <= 0 || h <= 0) return;
+    if (r * 2 > h) r = h / 2;
+    if (r * 2 > w) r = w / 2;
+    if (r < 2) {
+        C->fill_rect(d, x, y, w, h, col);
+        return;
+    }
+    C->fill_rect(d, x, y + r, w, h - 2 * r, col);
+    for (int i = 0; i < r; i++) {
+        int t = 2 * (r - i) - 1;
+        int inset = r - isqrt_i(4 * r * r - t * t) / 2;
+        C->fill_rect(d, x + inset, y + i, w - 2 * inset, 1, col);
+        C->fill_rect(d, x + inset, y + h - 1 - i, w - 2 * inset, 1, col);
+    }
+}
+
+/* A label pill: blue and filled when on, a soft card with dim text when off. Returns its width. */
+static int pill(az_draw *d, int x, int y, int h, const char *s, int px, int on, const pal_t *P)
 {
     int w = C->text_width(s, px) + h;
-    if (on) C->fill_rect(d, x, y, w, h, hi);
-    else C->draw_rect(d, x, y, w, h, 2, dim);
-    text_in(d, x + h / 2, y, h, s, px, on ? hit : dim);
+    rrect(d, x, y, w, h, h / 2, on ? P->blue : P->card);
+    text_in(d, x + h / 2, y, h, s, px, on ? P->on_blue : P->dim);
     return w;
 }
 
+/* A round tick box. on: filled with on_col and a mark; off: a ring in ring_col over bgc. */
+static void check_dot(az_draw *d, int x, int y, int s, int on, uint32_t on_col, uint32_t ring_col, uint32_t bgc,
+                      uint32_t mark)
+{
+    if (on) {
+        rrect(d, x, y, s, s, s / 2, on_col);
+        if (AZ_HAS(C, draw_line)) {
+            C->draw_line(d, x + s * 26 / 100, y + s * 52 / 100, x + s * 43 / 100, y + s * 68 / 100, 2, mark);
+            C->draw_line(d, x + s * 43 / 100, y + s * 68 / 100, x + s * 76 / 100, y + s * 32 / 100, 2, mark);
+        }
+    } else {
+        rrect(d, x, y, s, s, s / 2, ring_col);
+        rrect(d, x + 2, y + 2, s - 4, s - 4, (s - 4) / 2, bgc);
+    }
+}
+
 /* ---- the overlay ----------------------------------------------------------------------- */
-static const int OV_OFF[4] = { 34, 48, 64, 84 };    /* px under the Tag List tab's touch point */
-static const int TAB_HW[3] = { 70, 100, 140 };      /* half width of the tab's touch zone */
-#define TAB_HH 34                                   /* half height of the tab bar's band */
+static const int OV_OFF[4] = { 34, 48, 64, 84 };    /* px added under the tab bar line (DEF_TAB_Y) */
 #define DEF_TAB_Y 70
 
 static void pk_toggle(int i);
 
 static void ov_place(void)
 {
-    int ty = __atomic_load_n(&a_tab_y, __ATOMIC_RELAXED);
-    if (ty < 0) ty = DEF_TAB_Y;
-    int top = clampi(ty + OV_OFF[clampi(st_row(h_otop, 1), 0, 3)], 0, SCREEN_H - 240);
+    int top = clampi(DEF_TAB_Y + OV_OFF[clampi(st_row(h_otop, 1), 0, 3)], 0, SCREEN_H - 240);
     C->surface_place(ov, (az_rect) { 0, top, SCREEN_W, SCREEN_H - top });
 }
 
@@ -826,19 +945,17 @@ static void close_overlay(void)
 }
 
 /* UP / DN touch buttons over the right end of a list: the way to scroll when the knob is not ours */
-static void scroll_btns(az_draw *d, int x, int y0, int h, int w, int px)
+static void scroll_btns(az_draw *d, int x, int y0, int h, int w, int px, const pal_t *P)
 {
-    const uint32_t hi = C->color(AZ_COL_HI), text = C->color(AZ_COL_TEXT), bg = C->color(AZ_COL_BG);
     int bh = h / 2 - 4;
     if (bh > w * 3 / 2) bh = w * 3 / 2;
     if (bh < 12) return;
     static const char *const LBL[2] = { "UP", "DN" };
     for (int i = 0; i < 2; i++) {
         int by = i == 0 ? y0 : y0 + h - bh;
-        C->fill_rect(d, x, by, w, bh, bg);
-        C->draw_rect(d, x, by, w, bh, 2, hi);
+        rrect(d, x, by, w, bh, 12, P->card);
         int tw = C->text_width(LBL[i], px);
-        C->draw_text(d, x + (w - tw) / 2, by + (bh - px * 3 / 2) / 2, LBL[i], px, text);
+        C->draw_text(d, x + (w - tw) / 2, by + (bh - px * 3 / 2) / 2, LBL[i], px, P->blue);
     }
 }
 
@@ -854,19 +971,19 @@ static void pick_paint(az_draw *d, az_rect area)
     memcpy(w, g_watch, sizeof w);
     st_unlock();
 
-    const uint32_t text = C->color(AZ_COL_TEXT), dim = C->color(AZ_COL_TEXT_DIM);
-    const uint32_t hi = C->color(AZ_COL_HI), hit = C->color(AZ_COL_HI_TEXT), bg = C->color(AZ_COL_BG);
+    const pal_t P = get_pal();
+    const uint32_t soft = mix(P.blue, P.on_blue, 70);
     const int row = C->row_height(d), pad = row / 4, box = row - 2 * pad;
     const int px = clampi(row * 2 / 5, 8, 96), px_s = clampi(row * 28 / 100, 8, 96);
     const int bottom = area.y + area.h;
     int y = area.y;
-    C->fill_rect(d, area.x, y, area.w, area.h, bg);
+    C->fill_rect(d, area.x, y, area.w, area.h, P.bg);
 
     /* top bar: back to the results, and the title */
     const int bh = row * 4 / 5, bw = C->text_width("< RESULTS", px_s) + row;
-    C->fill_rect(d, area.x + pad, y + pad / 2, bw, bh, hi);
-    text_in(d, area.x + pad + row / 2, y + pad / 2, bh, "< RESULTS", px_s, hit);
-    C->draw_text(d, area.x + pad + bw + pad, y + pad / 2 + (bh - px * 3 / 2) / 2, "Playlists to watch", px, text);
+    rrect(d, area.x + pad, y + pad / 2, bw, bh, bh / 2, P.blue);
+    text_in(d, area.x + pad + row / 2, y + pad / 2, bh, "< RESULTS", px_s, P.on_blue);
+    C->draw_text(d, area.x + pad + bw + pad, y + pad / 2 + (bh - px * 3 / 2) / 2, "Playlists to watch", px, P.text);
     __atomic_store_n(&a_pb_x, area.x, __ATOMIC_RELAXED);
     __atomic_store_n(&a_pb_y, area.y, __ATOMIC_RELAXED);
     __atomic_store_n(&a_pb_w, bw + 2 * pad, __ATOMIC_RELAXED);
@@ -880,14 +997,14 @@ static void pick_paint(az_draw *d, az_rect area)
         const char *m = "Reading the library...";
         if (st == 2) m = "No rekordbox library found. Insert a USB, then use Rescan library.";
         else if (st == 3) m = "The library has no playlists.";
-        draw_fitted(d, area.x + pad, y + pad, m, px, text, area.w - 2 * pad);
+        draw_fitted(d, area.x + pad, y + pad, m, px, P.text, area.w - 2 * pad);
         return;
     }
     int on = 0;
     for (int i = 0; i < nn; i++) on += st_watch_has(w, nm[i]);
     if (on) snprintf(buf, sizeof buf, "%d watched: only tracks from the playing track's watched playlists are suggested.", on);
     else snprintf(buf, sizeof buf, "Tap the playlists to search in (hip-hop, house...). Leave ALL unticked.");
-    draw_fitted(d, area.x + pad, y + (row * 3 / 4 - px_s * 3 / 2) / 2, buf, px_s, dim, area.w - 2 * pad);
+    draw_fitted(d, area.x + pad, y + (row * 3 / 4 - px_s * 3 / 2) / 2, buf, px_s, P.dim, area.w - 2 * pad);
     y += row * 3 / 4;
 
     const int vis = clampi((bottom - y) / row, 1, MAX_PL);
@@ -906,18 +1023,21 @@ static void pick_paint(az_draw *d, az_rect area)
     const int list_y = y;
     for (int i = top; i < nn && i < top + vis && y + row <= bottom; i++) {
         const int is_sel = (i == sel);
-        if (is_sel) C->fill_rect(d, area.x, y, area.w - gut, row, hi);
-        C->draw_checkbox(d, area.x + pad, y + pad, box, st_watch_has(w, nm[i]), is_sel);
+        const int ticked = st_watch_has(w, nm[i]);
+        if (is_sel) rrect(d, area.x + pad / 2, y + 1, area.w - gut - pad, row - 2, 12, P.blue);
+        else C->fill_rect(d, area.x + 2 * pad + box, y + row - 1, area.w - gut - 3 * pad - box, 1, P.sep);
+        if (is_sel) check_dot(d, area.x + pad + pad / 2, y + pad, box, ticked, P.on_blue, P.on_blue, P.blue, P.blue);
+        else check_dot(d, area.x + pad + pad / 2, y + pad, box, ticked, P.blue, P.dim, P.bg, P.on_blue);
         snprintf(buf, sizeof buf, "%d tracks", cnt[i]);
         int cw = C->text_width(buf, px_s);
-        draw_fitted(d, area.x + 2 * pad + box, y + (row - px * 3 / 2) / 2, nm[i], px, is_sel ? hit : text,
-                    area.w - gut - 4 * pad - box - cw);
+        draw_fitted(d, area.x + 2 * pad + box + pad / 2, y + (row - px * 3 / 2) / 2, nm[i], px,
+                    is_sel ? P.on_blue : P.text, area.w - gut - 5 * pad - box - cw);
         C->draw_text(d, area.x + area.w - gut - pad - cw, y + (row - px_s * 3 / 2) / 2, buf, px_s,
-                     is_sel ? hit : dim);
+                     is_sel ? soft : P.dim);
         y += row;
     }
     if (gut) {
-        scroll_btns(d, area.x + area.w - gut + 2, list_y, vis * row, gut - 4, px);
+        scroll_btns(d, area.x + area.w - gut + 2, list_y, vis * row, gut - 4, px, &P);
         __atomic_store_n(&a_gut_x, area.x + area.w - gut, __ATOMIC_RELAXED);
         __atomic_store_n(&a_gut_w, gut, __ATOMIC_RELAXED);
     }
@@ -940,7 +1060,7 @@ static void ov_paint(az_draw *d, az_rect area, void *user)
 
     const int row = C->row_height(d);
     const int pad = row * 3 / 10;
-    const int card_h = row * 5 / 2, flt_h = row * 9 / 10, col_h = row * 3 / 5;
+    const int card_h = row * 11 / 4, flt_h = row * 9 / 10, col_h = row * 3 / 5;
     const int lh = row * 4 / 5, foot_h = row * 7 / 10;
     int vmax = (area.h - card_h - flt_h - col_h - foot_h) / lh;
     vmax = clampi(vmax, 1, VIS_MAX);
@@ -961,63 +1081,63 @@ static void ov_paint(az_draw *d, az_rect area, void *user)
     __atomic_store_n(&a_top, top, __ATOMIC_RELAXED);
     __atomic_store_n(&a_sel, sel, __ATOMIC_RELAXED);
 
-    const uint32_t text = C->color(AZ_COL_TEXT), dim = C->color(AZ_COL_TEXT_DIM);
-    const uint32_t hi = C->color(AZ_COL_HI), hit = C->color(AZ_COL_HI_TEXT), bg = C->color(AZ_COL_BG);
-    const uint32_t card = mix(bg, text, 22), zebra = mix(bg, text, 12), rail = mix(bg, text, 50);
-    const int px_s = clampi(row * 27 / 100, 10, 96);      /* small labels */
-    const int px_m = clampi(row * 36 / 100, 10, 96);      /* body */
-    const int px_l = clampi(row * 52 / 100, 10, 96);      /* the playing title */
-    const int px_b = clampi(row * 95 / 100, 10, 96);      /* the BPM figure */
+    const pal_t P = get_pal();
+    const uint32_t soft = mix(P.blue, P.on_blue, 70);      /* secondary text on a blue row */
+    const uint32_t soft_bg = mix(P.blue, P.on_blue, 40);   /* a badge on a blue row */
+    const int R = clampi(row * 30 / 100, 6, 14);
+    const int px_s = clampi(row * 27 / 100, 10, 96);       /* small labels */
+    const int px_m = clampi(row * 36 / 100, 10, 96);       /* body */
+    const int px_l = clampi(row * 52 / 100, 10, 96);       /* the playing title */
+    const int px_b = clampi(row * 95 / 100, 10, 96);       /* the BPM figure */
     const int X0 = area.x + pad, X1 = area.x + area.w - pad;
     int y = area.y;
+    C->fill_rect(d, area.x, area.y, area.w, area.h, P.bg);
 
     /* ---- card: the playing track ---- */
-    C->fill_rect(d, area.x, y, area.w, card_h, card);
-    C->fill_rect(d, area.x, y, pad / 2 + 2, card_h, hi);
+    rrect(d, X0, y + pad / 2, X1 - X0, card_h - pad, R + 4, P.card);
     char buf[200];
     if (cx.status != ST_OK) {
         const char *m = "Reading the library...";
         if (cx.status == ST_NOLIB) m = "No rekordbox library found. Insert a USB, then use Rescan library.";
         else if (cx.status == ST_NOTRACK) m = "Load or play a track on a deck.";
-        text_in(d, X0 + pad, y, px_s * 3 / 2 + pad, "SMART TRACK", px_s, dim);
-        fitted_in(d, X0 + pad, y + pad, card_h - pad, m, px_l, text, X1 - X0 - pad);
-        {   /* the playlists can still be chosen */
-            int bh = px_s * 3 / 2 + pad, bw = C->text_width("PLAYLISTS >", px_s) + row;
-            C->fill_rect(d, X1 - bw, y + pad / 2, bw, bh, hi);
-            text_in(d, X1 - bw + row / 2, y + pad / 2, bh, "PLAYLISTS >", px_s, hit);
-            __atomic_store_n(&a_pl_x, X1 - bw - pad, __ATOMIC_RELAXED);
-            __atomic_store_n(&a_pl_y, y, __ATOMIC_RELAXED);
-            __atomic_store_n(&a_pl_w, bw + 2 * pad, __ATOMIC_RELAXED);
-            __atomic_store_n(&a_pl_h, bh + pad, __ATOMIC_RELAXED);
-        }
+        int bh = px_s * 3 / 2 + pad, bw = C->text_width("PLAYLISTS >", px_s) + row;
+        text_in(d, X0 + pad, y, px_s * 3 / 2 + pad, "SMART TRACK", px_s, P.dim);
+        fitted_in(d, X0 + pad, y + pad, card_h - pad, m, px_l, P.text, X1 - X0 - 3 * pad - bw);
+        rrect(d, X1 - bw - pad / 2, y + pad, bw, bh, bh / 2, P.blue);      /* the playlists can still be chosen */
+        text_in(d, X1 - bw - pad / 2 + row / 2, y + pad, bh, "PLAYLISTS >", px_s, P.on_blue);
+        __atomic_store_n(&a_pl_x, X1 - bw - pad, __ATOMIC_RELAXED);
+        __atomic_store_n(&a_pl_y, y, __ATOMIC_RELAXED);
+        __atomic_store_n(&a_pl_w, bw + 2 * pad, __ATOMIC_RELAXED);
+        __atomic_store_n(&a_pl_h, bh + 2 * pad, __ATOMIC_RELAXED);
         return;
     }
+    const int cy = y + pad;
     snprintf(buf, sizeof buf, "NOW PLAYING   DECK %d", cx.deck + 1);
-    C->draw_text(d, X0 + pad, y + pad / 2, buf, px_s, dim);
-    int ty = y + pad / 2 + px_s * 3 / 2;
+    C->draw_text(d, X0 + pad, cy, buf, px_s, P.dim);
+    int ty = cy + px_s * 3 / 2;
     int left_w = area.w * 58 / 100 - pad;
-    draw_fitted(d, X0 + pad, ty, cx.title, px_l, text, left_w);
+    draw_fitted(d, X0 + pad, ty, cx.title, px_l, P.text, left_w);
     ty += px_l * 3 / 2;
-    draw_fitted(d, X0 + pad, ty, cx.artist, px_m, dim, left_w);
+    draw_fitted(d, X0 + pad, ty, cx.artist, px_m, P.dim, left_w);
     ty += px_m * 3 / 2;
     if (cx.pls[0]) {
         snprintf(buf, sizeof buf, "in %s", cx.pls);
-        draw_fitted(d, X0 + pad, ty, buf, px_s, dim, left_w);
+        draw_fitted(d, X0 + pad, ty, buf, px_s, P.dim, left_w);
     }
     {   /* right block: BPM figure, key badge */
         int rx = area.x + area.w * 62 / 100;
         snprintf(buf, sizeof buf, "%.1f", (double) cx.bpm);
-        C->draw_text(d, rx, y + pad / 2, buf, px_b, text);
-        C->draw_text(d, rx + C->text_width(buf, px_b) + pad / 2, y + pad / 2 + px_b * 3 / 2 - px_m * 3 / 2 - 4,
-                     "BPM", px_m, dim);
-        int by = y + pad / 2 + px_b * 3 / 2 + 2, bh = px_m * 3 / 2 + 6;
+        C->draw_text(d, rx, cy, buf, px_b, P.text);
+        C->draw_text(d, rx + C->text_width(buf, px_b) + pad / 2, cy + px_b * 3 / 2 - px_m * 3 / 2 - 4, "BPM", px_m,
+                     P.dim);
+        int by = cy + px_b * 3 / 2 + 2, bh = px_m * 3 / 2 + 6;
         if (cx.key[0]) {
             int bw = C->text_width(cx.key, px_m) + pad * 2;
-            C->fill_rect(d, rx, by, bw, bh, hi);
-            text_in(d, rx + pad, by, bh, cx.key, px_m, hit);
-            C->draw_text(d, rx + bw + pad / 2, by + (bh - px_s * 3 / 2) / 2, "KEY", px_s, dim);
+            rrect(d, rx, by, bw, bh, bh / 2, P.blue);
+            text_in(d, rx + pad, by, bh, cx.key, px_m, P.on_blue);
+            C->draw_text(d, rx + bw + pad / 2, by + (bh - px_s * 3 / 2) / 2, "KEY", px_s, P.dim);
         } else {
-            C->draw_text(d, rx, by + (bh - px_s * 3 / 2) / 2, "KEY unknown", px_s, dim);
+            C->draw_text(d, rx, by + (bh - px_s * 3 / 2) / 2, "KEY unknown", px_s, P.dim);
         }
     }
     y += card_h;
@@ -1027,19 +1147,19 @@ static void ov_paint(az_draw *d, az_rect area, void *user)
         int fy = y + flt_h / 6, fh = flt_h * 2 / 3, fx = X0;
         const char *km = cx.kmode == 0 ? "KEY =" : (cx.kmode == 1 ? "KEY +/-1" : "KEY +/-1 +REL");
         snprintf(buf, sizeof buf, "BPM +/-%d", cx.tol);
-        fx += pill(d, fx, fy, fh, buf, px_s, cx.f_bpm, hi, hit, dim) + pad / 2;
-        fx += pill(d, fx, fy, fh, km, px_s, cx.f_key, hi, hit, dim) + pad / 2;
-        int pw = pill(d, fx, fy, fh, "PLAYLIST >", px_s, cx.f_pl, hi, hit, dim);
+        fx += pill(d, fx, fy, fh, buf, px_s, cx.f_bpm, &P) + pad / 2;
+        fx += pill(d, fx, fy, fh, km, px_s, cx.f_key, &P) + pad / 2;
+        int pw = pill(d, fx, fy, fh, "PLAYLIST >", px_s, cx.f_pl, &P);
         __atomic_store_n(&a_pl_x, fx - pad, __ATOMIC_RELAXED);
         __atomic_store_n(&a_pl_y, y, __ATOMIC_RELAXED);
         __atomic_store_n(&a_pl_w, pw + 2 * pad, __ATOMIC_RELAXED);
         __atomic_store_n(&a_pl_h, flt_h, __ATOMIC_RELAXED);
         fx += pw;
         int nx = area.x + area.w * 52 / 100;
-        C->draw_text(d, nx, fy + (fh - px_s * 3 / 2) / 2, "SET NAME", px_s, dim);
+        C->draw_text(d, nx, fy + (fh - px_s * 3 / 2) / 2, "SET NAME", px_s, P.dim);
         int bx = nx + C->text_width("SET NAME", px_s) + pad / 2;
-        C->draw_rect(d, bx, fy, X1 - bx, fh, 2, hi);
-        fitted_in(d, bx + pad / 2, fy, fh, cx.name, px_m, text, X1 - bx - pad);
+        rrect(d, bx, fy, X1 - bx, fh, fh / 2, P.card);
+        fitted_in(d, bx + pad, fy, fh, cx.name, px_m, P.text, X1 - bx - 2 * pad);
     }
     y += flt_h;
 
@@ -1053,14 +1173,13 @@ static void ov_paint(az_draw *d, az_rect area, void *user)
     const int w_tit = rest * 50 / 100, w_art = rest * 28 / 100;
     const int c_bpm = X0, c_dif = c_bpm + w_bpm, c_key = c_dif + w_dif, c_tit = c_key + w_key;
     const int c_art = c_tit + w_tit, c_pl = c_art + w_art;
-    C->fill_rect(d, area.x, y, area.w, col_h, bg);
-    text_in(d, c_bpm, y, col_h, "BPM", px_s, dim);
-    text_in(d, c_dif, y, col_h, "DIFF", px_s, dim);
-    text_in(d, c_key, y, col_h, "KEY", px_s, dim);
-    text_in(d, c_tit, y, col_h, "TITLE", px_s, dim);
-    text_in(d, c_art, y, col_h, "ARTIST", px_s, dim);
-    text_in(d, c_pl, y, col_h, "PLAYLIST", px_s, dim);
-    C->fill_rect(d, X0, y + col_h - 2, X1 - X0, 1, rail);
+    text_in(d, c_bpm, y, col_h, "BPM", px_s, P.dim);
+    text_in(d, c_dif, y, col_h, "DIFF", px_s, P.dim);
+    text_in(d, c_key, y, col_h, "KEY", px_s, P.dim);
+    text_in(d, c_tit, y, col_h, "TITLE", px_s, P.dim);
+    text_in(d, c_art, y, col_h, "ARTIST", px_s, P.dim);
+    text_in(d, c_pl, y, col_h, "PLAYLIST", px_s, P.dim);
+    C->fill_rect(d, X0, y + col_h - 2, X1 - X0, 1, P.sep);
     y += col_h;
 
     __atomic_store_n(&a_row_y0, y, __ATOMIC_RELAXED);
@@ -1068,31 +1187,30 @@ static void ov_paint(az_draw *d, az_rect area, void *user)
     __atomic_store_n(&a_vis, vmax, __ATOMIC_RELAXED);
 
     if (n == 0) {
-        fitted_in(d, X0, y, lh * 2, "Nothing matches. Loosen a filter in Mod Menu > Smart Track.", px_m, text,
+        fitted_in(d, X0, y, lh * 2, "Nothing matches. Loosen a filter in Mod Menu > Smart Track.", px_m, P.text,
                   X1 - X0);
-        if (cx.note[0]) fitted_in(d, X0, y + lh * 2, lh, cx.note, px_s, dim, X1 - X0);
+        if (cx.note[0]) fitted_in(d, X0, y + lh * 2, lh, cx.note, px_s, P.dim, X1 - X0);
     }
     for (int i = 0; i < cnt; i++) {
         const res_t *r = &vis[i];
         const int is_sel = (top + i == sel);
         const int ry = y + i * lh;
-        if (is_sel) C->fill_rect(d, area.x, ry, area.w - sbw - gutw, lh, hi);
-        else if (i & 1) C->fill_rect(d, area.x, ry, area.w - sbw - gutw, lh, zebra);
-        const uint32_t c1 = is_sel ? hit : text, c2 = is_sel ? hit : dim;
+        if (is_sel) rrect(d, area.x + pad / 2, ry + 1, area.w - sbw - gutw - pad, lh - 2, R, P.blue);
+        else C->fill_rect(d, X0, ry + lh - 1, X1 - sbw - gutw - X0, 1, P.sep);
+        const uint32_t c1 = is_sel ? P.on_blue : P.text, c2 = is_sel ? soft : P.dim;
         snprintf(buf, sizeof buf, "%.1f", (double) r->bpm);
         fitted_in(d, c_bpm, ry, lh, buf, px_m, c1, w_bpm);
         float df = r->bpm - cx.bpm;
         snprintf(buf, sizeof buf, "%+.1f", (double) df);
         fitted_in(d, c_dif, ry, lh, buf, px_m, c2, w_dif);
-        {   /* key: filled badge when it is the same key, outlined otherwise */
-            int bh = lh - 8, bw = C->text_width("12A", px_m) + pad * 2, by = ry + 4;
-            uint32_t edge = is_sel ? hit : hi;
+        {   /* key: solid blue pill when it is the same key, a soft pill otherwise */
+            int bh = lh - 10, bw = C->text_width("12A", px_m) + pad * 2, by = ry + 5;
             if (r->same_key) {
-                C->fill_rect(d, c_key, by, bw, bh, edge);
-                text_in(d, c_key + pad, by, bh, r->key, px_m, is_sel ? hi : hit);
+                rrect(d, c_key, by, bw, bh, bh / 2, is_sel ? P.on_blue : P.blue);
+                text_in(d, c_key + pad, by, bh, r->key, px_m, is_sel ? P.blue : P.on_blue);
             } else {
-                C->draw_rect(d, c_key, by, bw, bh, 2, edge);
-                text_in(d, c_key + pad, by, bh, r->key, px_m, c1);
+                rrect(d, c_key, by, bw, bh, bh / 2, is_sel ? soft_bg : P.card);
+                text_in(d, c_key + pad, by, bh, r->key, px_m, is_sel ? P.on_blue : P.dim);
             }
         }
         fitted_in(d, c_tit, ry, lh, r->title, px_m, c1, w_tit - pad);
@@ -1100,7 +1218,7 @@ static void ov_paint(az_draw *d, az_rect area, void *user)
         fitted_in(d, c_pl, ry, lh, r->pl, px_s, c2, X1 - sbw - gutw - c_pl);
     }
     if (gutw) {
-        scroll_btns(d, area.x + area.w - sbw - gutw + 2, y, vmax * lh, gutw - 4, px_m);
+        scroll_btns(d, area.x + area.w - sbw - gutw + 2, y, vmax * lh, gutw - 4, px_m, &P);
         __atomic_store_n(&a_gut_x, area.x + area.w - sbw - gutw, __ATOMIC_RELAXED);
         __atomic_store_n(&a_gut_w, gutw, __ATOMIC_RELAXED);
     }
@@ -1109,20 +1227,20 @@ static void ov_paint(az_draw *d, az_rect area, void *user)
         int th = vmax * lh;
         int bh2 = clampi(th * vmax / n, 24, th);
         int by2 = y + (th - bh2) * top / (n - vmax);
-        C->fill_rect(d, area.x + area.w - sbw + 2, y, 4, th, zebra);
-        C->fill_rect(d, area.x + area.w - sbw + 2, by2, 4, bh2, hi);
+        rrect(d, area.x + area.w - sbw + 2, y, 4, th, 2, P.card);
+        rrect(d, area.x + area.w - sbw + 2, by2, 4, bh2, 2, P.dim);
     }
     /* footer */
     int fy = y + vmax * lh;
     if (n > 0) {
         snprintf(buf, sizeof buf, "%d / %d   (%d match%s)", sel + 1, n, cx.total, cx.total == 1 ? "" : "es");
-        fitted_in(d, X0, fy, foot_h, buf, px_s, dim, area.w / 3);
+        fitted_in(d, X0, fy, foot_h, buf, px_s, P.dim, area.w / 3);
     }
-    if (cx.note[0]) fitted_in(d, area.x + area.w * 36 / 100, fy, foot_h, cx.note, px_s, dim, area.w * 30 / 100);
+    if (cx.note[0]) fitted_in(d, area.x + area.w * 36 / 100, fy, foot_h, cx.note, px_s, P.dim, area.w * 26 / 100);
     {
-        const char *hint = "KNOB or UP/DN scroll   CLICK details   BACK close";
+        const char *hint = "DOUBLE TAP: select in library   KNOB scroll   BACK close";
         int hw = C->text_width(hint, px_s);
-        text_in(d, X1 - hw, fy, foot_h, hint, px_s, dim);
+        text_in(d, X1 - hw, fy, foot_h, hint, px_s, P.dim);
     }
 }
 
@@ -1147,6 +1265,36 @@ static void ov_move(int delta)
                          __ATOMIC_RELAXED);
     }
     C->surface_redraw(ov);
+}
+
+/* Select the track in EP147's own library list: the worker plans the jump, the mixer filter turns
+ * the browse knob for us. The overlay closes first so that the knob goes back to EP147. */
+static void go_library(int i)
+{
+    char t[112];
+    uint32_t id = 0;
+    int stick = 0, ok = 0;
+    t[0] = '\0';
+    st_lock();
+    if (i >= 0 && i < g_ctx.nres) {
+        id = g_res[i].id;
+        stick = g_res[i].stick;
+        snprintf(t, sizeof t, "%.50s - %.50s", g_res[i].title, g_res[i].artist);
+        ok = 1;
+    }
+    st_unlock();
+    if (!ok) return;
+    if (st_row(h_goto, 1) != 1 || !g_filter_ok) {
+        C->banner(MOD_ID, t, 4000);                 /* no jump: just the full title */
+        return;
+    }
+    __atomic_store_n(&a_goto_stick, stick, __ATOMIC_RELAXED);
+    __atomic_store_n(&a_goto_id, (int) id, __ATOMIC_RELAXED);
+    __atomic_store_n(&a_goto_req, 1, __ATOMIC_RELEASE);
+    close_overlay();
+    char b[112];
+    snprintf(b, sizeof b, "Library: %.90s", t);
+    C->banner(MOD_ID, b, 3000);
 }
 
 static int ov_input(const az_event *ev, void *user)
@@ -1203,8 +1351,22 @@ static int ov_input(const az_event *ev, void *user)
         st_lock();
         n = g_ctx.nres;
         st_unlock();
-        if (__atomic_load_n(&a_top, __ATOMIC_RELAXED) + r < n)
-            __atomic_store_n(&a_sel, __atomic_load_n(&a_top, __ATOMIC_RELAXED) + r, __ATOMIC_RELAXED);
+        if (__atomic_load_n(&a_top, __ATOMIC_RELAXED) + r < n) {
+            int i = __atomic_load_n(&a_top, __ATOMIC_RELAXED) + r;
+            __atomic_store_n(&a_sel, i, __ATOMIC_RELAXED);
+            C->surface_redraw(ov);
+            static long tap_ms;                          /* UI thread only */
+            static int tap_row = -1;
+            long now = now_ms();
+            if (i == tap_row && now - tap_ms < 500) {    /* a double tap: select it in the library */
+                tap_row = -1;
+                go_library(i);
+            } else {                                     /* a single tap: just highlight it here */
+                tap_row = i;
+                tap_ms = now;
+            }
+            return 1;
+        }
         C->surface_redraw(ov);
         return 1;
     }
@@ -1214,14 +1376,7 @@ static int ov_input(const az_event *ev, void *user)
             C->surface_redraw(ov);
             return 1;
         }
-        char b[112];
-        int sel = __atomic_load_n(&a_sel, __ATOMIC_RELAXED);
-        b[0] = '\0';
-        st_lock();
-        if (sel >= 0 && sel < g_ctx.nres)
-            snprintf(b, sizeof b, "%.50s - %.50s", g_res[sel].title, g_res[sel].artist);
-        st_unlock();
-        if (b[0]) C->banner(MOD_ID, b, 4000);
+        go_library(__atomic_load_n(&a_sel, __ATOMIC_RELAXED));
         return 1;
     }
     case AZ_EV_BACK:
@@ -1242,19 +1397,19 @@ static const az_surface_v1 OVERLAY = {
     .views = AZ_VIEW_BIT(AZ_VIEW_BROWSE), .on_paint = ov_paint, .on_input = ov_input, .user = NULL,
 };
 
-/* ---- the SMART button (fallback, and until the tab is calibrated) ------------------------ */
+/* ---- the SMART button (opens and closes the overlay) -------------------------------------- */
 static void chip_paint(az_draw *d, az_rect area, void *user)
 {
     (void) user;
+    const pal_t P = get_pal();
     int on = __atomic_load_n(&a_active, __ATOMIC_RELAXED);
-    uint32_t bg = on ? C->color(AZ_COL_HI) : C->color(AZ_COL_BG);
-    uint32_t fg = on ? C->color(AZ_COL_HI_TEXT) : C->color(AZ_COL_TEXT);
-    C->fill_rect(d, area.x, area.y, area.w, area.h, bg);
-    C->draw_rect(d, area.x, area.y, area.w, area.h, 2, C->color(AZ_COL_HI));
+    C->fill_rect(d, area.x, area.y, area.w, area.h, P.bg);
+    rrect(d, area.x, area.y, area.w, area.h, area.h / 2, on ? P.blue : P.card);
     const char *s = on ? "SMART  ON" : "SMART TRACK";
     int px = clampi(area.h * 2 / 5, 8, 96);
     int tw = C->text_width(s, px);
-    C->draw_text(d, area.x + (area.w - tw) / 2, area.y + (area.h - px * 3 / 2) / 2, s, px, fg);
+    C->draw_text(d, area.x + (area.w - tw) / 2, area.y + (area.h - px * 3 / 2) / 2, s, px,
+                 on ? P.on_blue : P.blue);
 }
 
 static int chip_input(const az_event *ev, void *user)
@@ -1272,118 +1427,49 @@ static const az_surface_v1 CHIP = {
     .views = AZ_VIEW_BIT(AZ_VIEW_BROWSE), .on_paint = chip_paint, .on_input = chip_input, .user = NULL,
 };
 
-/* ---- the SET TAG LIST TAB button: calibration without the Mod Menu ----------------------- */
-static void cal_paint(az_draw *d, az_rect area, void *user)
-{
-    (void) user;
-    int calib = __atomic_load_n(&a_calib, __ATOMIC_RELAXED);
-    int set = __atomic_load_n(&a_tab_x, __ATOMIC_RELAXED) >= 0;
-    uint32_t bg = calib ? C->color(AZ_COL_HI) : C->color(AZ_COL_BG);
-    uint32_t fg = calib ? C->color(AZ_COL_HI_TEXT) : C->color(AZ_COL_TEXT);
-    C->fill_rect(d, area.x, area.y, area.w, area.h, bg);
-    C->draw_rect(d, area.x, area.y, area.w, area.h, 2, C->color(AZ_COL_HI));
-    const char *s = calib ? "NOW TOUCH THE TAG LIST TAB" : (set ? "TAG LIST TAB SET - REDO" : "SET TAG LIST TAB");
-    int px = clampi(area.h * 3 / 10, 8, 96);
-    while (px > 8 && C->text_width(s, px) > area.w - 8) px--;
-    int tw = C->text_width(s, px);
-    C->draw_text(d, area.x + (area.w - tw) / 2, area.y + (area.h - px * 3 / 2) / 2, s, px, fg);
-}
-
-static int cal_input(const az_event *ev, void *user)
-{
-    (void) user;
-    if (ev->kind == AZ_EV_TAP) {
-        if (__atomic_load_n(&a_calib, __ATOMIC_RELAXED)) {
-            __atomic_store_n(&a_calib, 0, __ATOMIC_RELEASE);          /* tap again: cancel */
-        } else {
-            __atomic_store_n(&a_calib_t, __atomic_load_n(&a_now_ms, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
-            __atomic_store_n(&a_calib, 1, __ATOMIC_RELEASE);
-            if (__atomic_load_n(&a_active, __ATOMIC_RELAXED)) close_overlay();
-        }
-        C->surface_redraw(cal);
-    }
-    return 1;
-}
-
-static const az_surface_v1 CAL = {
-    .size = sizeof(az_surface_v1), .layer = AZ_LAYER_TOP,
-    .views = AZ_VIEW_BIT(AZ_VIEW_BROWSE), .on_paint = cal_paint, .on_input = cal_input, .user = NULL,
-};
-
-/* ---- the Tag List tab: a touch filter (bus thread: atomics only, always PASS) -------------- */
-static int touch_fn(const az_touch *t, void *user)
-{
-    static int prev_down;
-    (void) user;
-    if (!t || t->slot != 0) return AZ_TOUCH_PASS;
-    int edge = t->down && !prev_down;
-    prev_down = t->down ? 1 : 0;
-    if (edge) {                                                  /* for the HUD */
-        __atomic_store_n(&a_touch_x, t->x, __ATOMIC_RELAXED);
-        __atomic_store_n(&a_touch_y, t->y, __ATOMIC_RELAXED);
-        __atomic_store_n(&a_touch_view, C->view(), __ATOMIC_RELAXED);
-        __atomic_add_fetch(&a_touch_n, 1, __ATOMIC_RELAXED);
-    }
-    if (!edge || C->view() != AZ_VIEW_BROWSE) return AZ_TOUCH_PASS;
-    if (t->y < CAL_Y + CAL_H + 6 && t->x >= CAL_X) return AZ_TOUCH_PASS;      /* our own buttons */
-
-    if (__atomic_load_n(&a_calib, __ATOMIC_RELAXED)) {          /* the DJ is teaching us the tab */
-        __atomic_store_n(&a_tab_x, t->x, __ATOMIC_RELAXED);
-        __atomic_store_n(&a_tab_y, t->y, __ATOMIC_RELAXED);
-        __atomic_store_n(&a_calib, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&a_calib_done, 1, __ATOMIC_RELEASE);
-        __atomic_store_n(&a_req, 1, __ATOMIC_RELEASE);
-        return AZ_TOUCH_PASS;
-    }
-    int tx = __atomic_load_n(&a_tab_x, __ATOMIC_RELAXED), tyy = __atomic_load_n(&a_tab_y, __ATOMIC_RELAXED);
-    if (!__atomic_load_n(&a_tab_on, __ATOMIC_RELAXED) || tx < 0) return AZ_TOUCH_PASS;
-    int dy = t->y - tyy, dx = t->x - tx;
-    if (dy < 0) dy = -dy;
-    if (dx < 0) dx = -dx;
-    if (dy > TAB_HH) return AZ_TOUCH_PASS;                      /* not the tab bar */
-    /* on the Tag List tab: open; on another tab: close. EP147 still switches tabs as usual. */
-    __atomic_store_n(&a_req, dx <= __atomic_load_n(&a_hw, __ATOMIC_RELAXED) ? 1 : 2, __ATOMIC_RELEASE);
-    return AZ_TOUCH_PASS;
-}
-
-static void act_calibrate(void *user)
-{
-    (void) user;
-    __atomic_store_n(&a_calib_t, __atomic_load_n(&a_now_ms, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
-    __atomic_store_n(&a_calib, 1, __ATOMIC_RELEASE);
-    C->banner(MOD_ID, "Close the menu, open Browse, then tap the TAG LIST tab", 6000);
-}
-
 /* ---- the status strip (Diagnostics): which version runs, and what it sees ---------------- */
+#define HUD_W 800
+#define HUD_H 52
+#define HB_W 120                         /* the HIDE button at the strip's right end */
+
 static void hud_paint(az_draw *d, az_rect area, void *user)
 {
     (void) user;
     static const char *const SCAN[4] = { "not read", "reading", "NO LIBRARY", "ok" };
     char l1[160], l2[160];
     int st = clampi(__atomic_load_n(&g_scan_state, __ATOMIC_ACQUIRE), 0, 3);
-    snprintf(l1, sizeof l1, "Smart Track v%s   library: %s   %d tracks   %d playlists   tick %d", MOD_VERSION,
+    snprintf(l1, sizeof l1, "Smart Track v%s   library: %s   %d tracks   %d playlists", MOD_VERSION,
              SCAN[st], __atomic_load_n(&g_ntracks_pub, __ATOMIC_ACQUIRE),
-             __atomic_load_n(&g_nnames, __ATOMIC_ACQUIRE), __atomic_load_n(&a_ticks, __ATOMIC_RELAXED));
-    int tx = __atomic_load_n(&a_tab_x, __ATOMIC_RELAXED), ty = __atomic_load_n(&a_tab_y, __ATOMIC_RELAXED);
-    char tab[32];
-    if (tx < 0) snprintf(tab, sizeof tab, "not set");
-    else snprintf(tab, sizeof tab, "%d,%d", tx, ty);
-    snprintf(l2, sizeof l2, "tab %s   last touch #%d at %d,%d (screen %d)   overlay %s   knob %s", tab,
-             __atomic_load_n(&a_touch_n, __ATOMIC_RELAXED), __atomic_load_n(&a_touch_x, __ATOMIC_RELAXED),
-             __atomic_load_n(&a_touch_y, __ATOMIC_RELAXED), __atomic_load_n(&a_touch_view, __ATOMIC_RELAXED),
-             __atomic_load_n(&a_active, __ATOMIC_RELAXED) ? "open" : "closed", a_focus ? "OURS" : "not ours");
-    const uint32_t text = C->color(AZ_COL_TEXT), bg = C->color(AZ_COL_BG);
-    C->fill_rect(d, area.x, area.y, area.w, area.h, mix(bg, text, 30));
+             __atomic_load_n(&g_nnames, __ATOMIC_ACQUIRE));
+    snprintf(l2, sizeof l2, "overlay %s   knob %s   library list %s",
+             __atomic_load_n(&a_active, __ATOMIC_RELAXED) ? "open" : "closed", a_focus ? "OURS" : "not ours",
+             __atomic_load_n(&a_cur_valid, __ATOMIC_RELAXED) ? "known" : "unknown");
+    const pal_t P = get_pal();
+    C->fill_rect(d, area.x, area.y, area.w, area.h, P.bg);
+    rrect(d, area.x + 2, area.y + 2, area.w - 4, area.h - 4, 14, P.card);
     int px = clampi(area.h * 5 / 16, 8, 96);
-    C->draw_text(d, area.x + 8, area.y + 3, l1, px, text);
-    C->draw_text(d, area.x + 8, area.y + 3 + px * 3 / 2, l2, px, text);
+    int tw = area.w - HB_W - 36;
+    draw_fitted(d, area.x + 16, area.y + 2, l1, px, P.text, tw);
+    draw_fitted(d, area.x + 16, area.y + 2 + px * 3 / 2, l2, px, P.dim, tw);
+
+    /* the HIDE button */
+    int bx = area.x + area.w - HB_W - 10, by = area.y + 8, bh = area.h - 16;
+    rrect(d, bx, by, HB_W, bh, bh / 2, P.blue);
+    const char *s = "X  HIDE";
+    int bpx = clampi(bh * 2 / 5, 8, 96);
+    C->draw_text(d, bx + (HB_W - C->text_width(s, bpx)) / 2, by + (bh - bpx * 3 / 2) / 2, s, bpx, P.on_blue);
 }
 
 static int hud_input(const az_event *ev, void *user)
 {
-    (void) ev;
     (void) user;
-    return 0;                          /* a status strip: touches go through to EP147 */
+    if (ev->kind != AZ_EV_TAP) return 0;       /* a status strip: other touches go through to EP147 */
+    if (!in_box(ev->x, ev->y, HUD_W - HB_W - 6, 0, HB_W + 6, HUD_H)) return 0;
+    if (h_diag < 0 || !AZ_HAS(C, row_set) || C->row_set(h_diag, 0) != 0) hud_force_off = 1;
+    last_hud = 0;
+    C->surface_show(hud, 0);
+    C->banner(MOD_ID, "Status strip hidden. Bring it back: Mod Menu > Smart Track > Status strip", 4000);
+    return 1;
 }
 
 static const az_surface_v1 HUD = {
@@ -1514,6 +1600,76 @@ static const az_screen_v1 PICKER = {
     .user = NULL,
 };
 
+/* ---- the browse knob, turned for us (bus thread: atomics only, always AZ_FRAME_OK) ---------- */
+/* The panel reports the browse knob as an absolute counter (+1 per detent clockwise). To move EP147's
+ * list we add to it: one detent at a time, and the sum stays added, so EP147 sees a knob that turned.
+ * A real turn of the knob stops a move in progress. While the overlay holds the knob, the turns are
+ * ours and are not counted. */
+#define BROWSE_BYTE 34
+#define BROWSE_PRESS 31
+#define STEP_MS 6
+
+static int mixer_fn(int bus, unsigned char *f, int len, void *user)
+{
+    static unsigned char off, last_raw, last_prs;
+    static int have_last;
+    static long last_ms;
+    (void) user;
+    if (bus != AZ_BUS_MIXER_IN || len <= BROWSE_BYTE) return AZ_FRAME_OK;
+    const unsigned char raw = f[BROWSE_BYTE];
+    const int prs = f[BROWSE_PRESS] & 1;
+    int up = __atomic_load_n(&a_inj_up, __ATOMIC_ACQUIRE), dn = __atomic_load_n(&a_inj_dn, __ATOMIC_ACQUIRE);
+    const int active = __atomic_load_n(&a_active, __ATOMIC_RELAXED);
+    if (have_last) {
+        if (raw != last_raw) {
+            if (up > 0 || dn > 0) {                          /* the DJ turned the knob: stop */
+                __atomic_store_n(&a_inj_up, 0, __ATOMIC_RELEASE);
+                __atomic_store_n(&a_inj_dn, 0, __ATOMIC_RELEASE);
+                __atomic_store_n(&a_inj_full, 0, __ATOMIC_RELAXED);
+                __atomic_store_n(&a_cur_valid, 0, __ATOMIC_RELEASE);
+                up = dn = 0;
+            } else if (!active) {                            /* a real turn on EP147's list */
+                __atomic_add_fetch(&a_cur, (int) (signed char) (unsigned char) (raw - last_raw), __ATOMIC_RELAXED);
+            }
+        }
+        if (prs && !last_prs && !active)                     /* a click opens a folder or a track */
+            __atomic_store_n(&a_cur_valid, 0, __ATOMIC_RELEASE);
+    }
+    last_raw = raw;
+    last_prs = (unsigned char) prs;
+    have_last = 1;
+
+    if (up > 0 || dn > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long ms = (long) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        if (ms - last_ms >= STEP_MS) {
+            last_ms = ms;
+            int per = __atomic_load_n(&a_inj_per, __ATOMIC_RELAXED);
+            if (per < 1) per = 1;
+            for (int k = 0; k < per && (up > 0 || dn > 0); k++) {
+                if (up > 0) {
+                    off = (unsigned char) (off - 1);
+                    up--;
+                    if (__atomic_load_n(&a_cur_valid, __ATOMIC_RELAXED)) __atomic_add_fetch(&a_cur, -1, __ATOMIC_RELAXED);
+                    if (up == 0 && __atomic_exchange_n(&a_inj_full, 0, __ATOMIC_ACQ_REL)) {
+                        __atomic_store_n(&a_cur, 0, __ATOMIC_RELAXED);      /* at the top for sure */
+                        __atomic_store_n(&a_cur_valid, 1, __ATOMIC_RELEASE);
+                    }
+                } else {
+                    off = (unsigned char) (off + 1);
+                    dn--;
+                    __atomic_add_fetch(&a_cur, 1, __ATOMIC_RELAXED);
+                }
+            }
+            __atomic_store_n(&a_inj_up, up, __ATOMIC_RELEASE);
+            __atomic_store_n(&a_inj_dn, dn, __ATOMIC_RELEASE);
+        }
+    }
+    f[BROWSE_BYTE] = (unsigned char) (raw + off);
+    return AZ_FRAME_OK;
+}
+
 /* ---- Mod Menu rows ---------------------------------------------------------------------- */
 static void act_rescan(void *user)
 {
@@ -1545,26 +1701,18 @@ static int add_row(int kind, const char *key, const char *label, const char *par
     return C->register_row(MOD_ID, &r);
 }
 
-static const char *const C_OPEN[] = { "Tag List tab", "SMART button", "Both" };
-static const char *const C_TABW[] = { "Narrow", "Normal", "Wide" };
 static const char *const C_TOP[] = { "Tight", "Normal", "Loose", "Looser" };
 static const char *const C_BPM[] = { "+/- 3 BPM", "+/- 6 BPM", "+/- 8 BPM", "+/- 10 BPM" };
 static const char *const C_KEY[] = { "Same key", "+/- 1 (Camelot)", "+/- 1 and relative" };
 static const char *const C_DECK[] = { "Auto (playing)", "Deck 1", "Deck 2", "Deck 3", "Deck 4" };
 static const char *const C_USB[] = { "Both USB", "USB 1 only", "USB 2 only" };
+static const char *const C_ORDER[] = { "Title A-Z", "Artist A-Z", "As on the stick" };
+static const char *const C_SPEED[] = { "Careful", "Normal", "Fast" };
 
 static int add_rows(void)
 {
     h_overlay = add_row(AZ_ROW_TOGGLE, "overlay", "Smart Track", NULL,
                         "Suggests tracks that fit the playing one.", AZ_ROW_DEFAULT_ON, NULL, 0, 0, NULL, NULL);
-    h_open = add_row(AZ_ROW_CHOICE, "open-with", "Open with", "overlay",
-                     "Touching the Tag List tab (calibrate it first), the SMART button, or both.", 0, C_OPEN, 3, 2,
-                     NULL, NULL);
-    int h_cal = add_row(AZ_ROW_ACTION, "calibrate", "Calibrate Tag List tab", NULL,
-                        "Then close the menu, open Browse and touch the TAG LIST tab once.", 0, NULL, 0, 0, NULL,
-                        act_calibrate);
-    h_tabw = add_row(AZ_ROW_CHOICE, "tab-width", "Tab touch width", "overlay",
-                     "How wide a zone around that point counts as the Tag List tab.", 0, C_TABW, 3, 1, NULL, NULL);
     h_otop = add_row(AZ_ROW_CHOICE, "overlay-top", "Overlay position", "overlay",
                      "Distance under the tab bar. Raise it if the overlay covers the tabs.", 0, C_TOP, 4, 1, NULL,
                      NULL);
@@ -1584,15 +1732,25 @@ static int add_rows(void)
                      0, C_DECK, 5, 0, NULL, NULL);
     h_usb = add_row(AZ_ROW_CHOICE, "usb", "Search in", NULL, "Which USB ports to suggest tracks from.",
                     0, C_USB, 3, 0, NULL, NULL);
+    h_goto = add_row(AZ_ROW_TOGGLE, "goto", "Select in library", NULL,
+                     "Double-tapping a suggested track scrolls EP147's track list to it (experimental).",
+                     AZ_ROW_DEFAULT_ON, NULL, 0, 0, NULL, NULL);
+    h_order = add_row(AZ_ROW_CHOICE, "goto-order", "Library order", "goto",
+                      "How EP147 sorts its track list. Must match, or the jump lands next to the track.", 0, C_ORDER,
+                      3, 0, NULL, NULL);
+    h_speed = add_row(AZ_ROW_CHOICE, "goto-speed", "Scroll speed", "goto",
+                      "Raise it if the jump is slow; lower it if it stops on the wrong track.", 0, C_SPEED, 3, 0,
+                      NULL, NULL);
     h_diag = add_row(AZ_ROW_TOGGLE, "diagnostics", "Status strip", NULL,
-                     "A small strip on Browse: version, library, touches. Turn off once it works.",
+                     "A small strip on Browse: version and library. Also hidden by its X HIDE button.",
                      AZ_ROW_DEFAULT_ON, NULL, 0, 0, NULL, NULL);
     int h_scan = add_row(AZ_ROW_ACTION, "rescan", "Rescan library", NULL,
                          "Reads the USB library again (after adding tracks or playlists).", 0, NULL, 0, 0, NULL,
                          act_rescan);
-    return h_overlay >= 0 && h_open >= 0 && h_cal >= 0 && h_tabw >= 0 && h_otop >= 0 && h_bpm >= 0 &&
+    return h_overlay >= 0 && h_otop >= 0 && h_bpm >= 0 &&
            h_bpm_rng >= 0 && h_key >= 0 && h_key_mode >= 0 && h_pl >= 0 && h_pick >= 0 && h_deck >= 0 &&
-           h_usb >= 0 && h_diag >= 0 && h_scan >= 0;
+           h_usb >= 0 && h_goto >= 0 && h_order >= 0 && h_speed >= 0 && h_diag >= 0 &&
+           h_scan >= 0;
 }
 
 /* ---- lifecycle -------------------------------------------------------------------------- */
@@ -1637,38 +1795,22 @@ static void tick(void)
         C->banner(MOD_ID, "Smart Track " MOD_VERSION " loaded", 3000);
     }
 
-    /* what the touch filter saw: open on the Tag List tab, close on another tab */
-    int rq = __atomic_exchange_n(&a_req, 0, __ATOMIC_ACQ_REL);
-    int active = __atomic_load_n(&a_active, __ATOMIC_RELAXED);
-    if (rq == 1 && !active) open_overlay();
-    else if (rq == 2 && active) close_overlay();
-
     if (now - last_tick_ms < 100) return;
     last_tick_ms = now;
 
-    int en = st_row(h_overlay, 1) == 1;
-    int mode = st_row(h_open, 2);                       /* 0 tab, 1 button, 2 both */
-    __atomic_store_n(&a_tab_on, en && mode != 1, __ATOMIC_RELAXED);
-    __atomic_store_n(&a_hw, TAB_HW[clampi(st_row(h_tabw, 1), 0, 2)], __ATOMIC_RELAXED);
-    int chip_on = en && (mode != 0 || __atomic_load_n(&a_tab_x, __ATOMIC_RELAXED) < 0);
-    if (chip_on != last_chip) {
-        last_chip = chip_on;
-        C->surface_show(chip, chip_on);
-    }
-    if (en != last_cal) {
-        last_cal = en;
-        C->surface_show(cal, en);
-    }
     {
-        int cs = __atomic_load_n(&a_calib, __ATOMIC_RELAXED) * 2 + (__atomic_load_n(&a_tab_x, __ATOMIC_RELAXED) >= 0);
-        if (cs != last_cal_sig) {
-            last_cal_sig = cs;
-            C->surface_redraw(cal);
-        }
+        static const int PER[3] = { 1, 2, 4 };                   /* knob detents per step */
+        __atomic_store_n(&a_inj_per, PER[clampi(st_row(h_speed, 0), 0, 2)], __ATOMIC_RELAXED);
+        if (C->view() != AZ_VIEW_BROWSE) __atomic_store_n(&a_cur_valid, 0, __ATOMIC_RELEASE);   /* the list may be new */
+    }
+    int en = st_row(h_overlay, 1) == 1;
+    if (en != last_chip) {
+        last_chip = en;
+        C->surface_show(chip, en);
     }
     if (!en && __atomic_load_n(&a_active, __ATOMIC_RELAXED)) close_overlay();
 
-    int hud_on = st_row(h_diag, 1) == 1;
+    int hud_on = st_row(h_diag, 1) == 1 && !hud_force_off;
     if (hud_on != last_hud) {
         last_hud = hud_on;
         C->surface_show(hud, hud_on);
@@ -1678,24 +1820,16 @@ static void tick(void)
         hs = hs * 31u + (unsigned) __atomic_load_n(&g_scan_state, __ATOMIC_RELAXED);
         hs = hs * 31u + (unsigned) __atomic_load_n(&g_ntracks_pub, __ATOMIC_RELAXED);
         hs = hs * 31u + (unsigned) __atomic_load_n(&g_nnames, __ATOMIC_RELAXED);
-        hs = hs * 31u + (unsigned) __atomic_load_n(&a_touch_n, __ATOMIC_RELAXED);
         hs = hs * 31u + (unsigned) __atomic_load_n(&a_active, __ATOMIC_RELAXED);
-        hs = hs * 31u + (unsigned) a_focus + (unsigned) __atomic_load_n(&a_tab_x, __ATOMIC_RELAXED);
+        hs = hs * 31u + (unsigned) a_focus;
+        hs = hs * 31u + (unsigned) __atomic_load_n(&a_cur_valid, __ATOMIC_RELAXED);
         if (hs != last_hud_sig) {
             last_hud_sig = hs;
             C->surface_redraw(hud);
         }
     }
 
-    if (__atomic_load_n(&a_calib, __ATOMIC_RELAXED) &&
-        now - __atomic_load_n(&a_calib_t, __ATOMIC_RELAXED) > 60000)
-        __atomic_store_n(&a_calib, 0, __ATOMIC_RELAXED);        /* gave up waiting */
-    if (__atomic_exchange_n(&a_calib_done, 0, __ATOMIC_ACQ_REL)) {
-        C->cfg_set(MOD_ID, "tab_x", __atomic_load_n(&a_tab_x, __ATOMIC_RELAXED));
-        C->cfg_set(MOD_ID, "tab_y", __atomic_load_n(&a_tab_y, __ATOMIC_RELAXED));
-        C->banner(MOD_ID, "Tag List tab saved", 2500);
-    }
-    int pos = st_row(h_otop, 1) * 10000 + __atomic_load_n(&a_tab_y, __ATOMIC_RELAXED) + 1;
+    int pos = st_row(h_otop, 1) + 1;
     if (pos != last_top) {
         last_top = pos;
         ov_place();
@@ -1743,33 +1877,26 @@ static int init(const az_core_v1 *core)
     snprintf(joined, sizeof joined, "%s%s%s", a, (a[0] && b[0]) ? ";" : "", b);
     st_copy(g_watch, sizeof g_watch, joined);
 
-    /* the Tag List tab's touch point, saved by the calibration */
-    if (AZ_HAS(C, cfg_get)) {
-        a_tab_x = C->cfg_get(MOD_ID, "tab_x", -1);
-        a_tab_y = C->cfg_get(MOD_ID, "tab_y", -1);
-        if (a_tab_x < 0 || a_tab_y < 0) a_tab_x = a_tab_y = -1;
-    }
-
     if (!AZ_HAS(C, register_row) || !add_rows())
         C->log(MOD_ID, "Mod Menu rows unavailable: running with default settings");
     if (C->on_deck_event(MOD_ID, on_deck, NULL) != 0) C->log(MOD_ID, "on_deck_event refused");
-    if (!AZ_HAS(C, touch_filter) || C->touch_filter(MOD_ID, touch_fn, NULL) != 0)
-        C->log(MOD_ID, "touch_filter refused: use the SMART button");
+
+    if (AZ_HAS(C, frame_filter) && C->frame_filter(MOD_ID, 1u << AZ_BUS_MIXER_IN, mixer_fn, NULL) == 0)
+        g_filter_ok = 1;
+    else
+        C->log(MOD_ID, "frame_filter refused: Select in library is off");
 
     ov = C->surface_create(MOD_ID, &OVERLAY);
     chip = C->surface_create(MOD_ID, &CHIP);
     hud = C->surface_create(MOD_ID, &HUD);
-    cal = C->surface_create(MOD_ID, &CAL);
-    if (!ov || !chip || !hud || !cal) {
+    if (!ov || !chip || !hud) {
         C->log(MOD_ID, "surface_create refused");
         return 4;
     }
     C->surface_place(chip, (az_rect) { CHIP_X, CHIP_Y, CHIP_W, CHIP_H });
     C->surface_show(chip, 1);
     C->surface_show(ov, 0);
-    C->surface_place(cal, (az_rect) { CAL_X, CAL_Y, CAL_W, CAL_H });
-    C->surface_show(cal, 0);                        /* tick shows it */
-    C->surface_place(hud, (az_rect) { 0, 0, 800, 52 });
+    C->surface_place(hud, (az_rect) { 0, 0, HUD_W, HUD_H });
     C->surface_show(hud, 0);                        /* tick shows it when Diagnostics is on */
     ov_place();
     if (C->thread_start(MOD_ID, "smart-scan", worker, NULL) != 0) {
