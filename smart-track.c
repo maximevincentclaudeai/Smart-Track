@@ -28,6 +28,7 @@
 #include "azmod-mod.h"
 
 #define MOD_ID "smart-track"
+#define MOD_VERSION "0.2.1"
 
 /* ---- layout (screen is 1280x800) ---------------------------------------------------------
  * The SDK cannot tell the Tag List tab from the Playlist tab (both are AZ_VIEW_BROWSE) and does
@@ -109,17 +110,19 @@ static int a_calib, a_calib_done, a_req;     /* calibration; touch filter -> tic
 static int a_tab_x = -1, a_tab_y = -1;       /* the Tag List tab's touch point, -1 = not calibrated */
 static int a_tab_on, a_hw = 100;             /* open from the tab; half width of its touch zone */
 static long a_calib_t, a_pk_ms;
+static int a_ticks, a_touch_n, a_touch_x, a_touch_y, a_touch_view = -1;   /* the HUD's facts */
 /* Painter -> input geometry (screen pixels). */
 static int a_row_y0, a_row_h, a_vis, a_top;
 
 /* UI-thread-only. */
 static int h_bpm = -1, h_bpm_rng = -1, h_key = -1, h_key_mode = -1, h_pl = -1;
-static int h_deck = -1, h_usb = -1, h_overlay = -1, h_otop = -1, h_open = -1, h_tabw = -1;
+static int h_diag = -1, h_deck = -1, h_usb = -1, h_overlay = -1, h_otop = -1, h_open = -1, h_tabw = -1;
 static int a_focus;
-static az_surface *ov, *chip;
+static az_surface *ov, *chip, *hud;
 static long last_tick_ms;
 static unsigned last_sig = 0xFFFFFFFFu;
-static int seen_ver = -1, last_top = -1, last_chip = -1;
+static int seen_ver = -1, last_top = -1, last_chip = -1, last_hud = -1, banner_done;
+static unsigned last_hud_sig = 0xFFFFFFFFu;
 
 static void st_lock(void)
 {
@@ -1074,6 +1077,12 @@ static int touch_fn(const az_touch *t, void *user)
     if (!t || t->slot != 0) return AZ_TOUCH_PASS;
     int edge = t->down && !prev_down;
     prev_down = t->down ? 1 : 0;
+    if (edge) {                                                  /* for the HUD */
+        __atomic_store_n(&a_touch_x, t->x, __ATOMIC_RELAXED);
+        __atomic_store_n(&a_touch_y, t->y, __ATOMIC_RELAXED);
+        __atomic_store_n(&a_touch_view, C->view(), __ATOMIC_RELAXED);
+        __atomic_add_fetch(&a_touch_n, 1, __ATOMIC_RELAXED);
+    }
     if (!edge || C->view() != AZ_VIEW_BROWSE) return AZ_TOUCH_PASS;
 
     if (__atomic_load_n(&a_calib, __ATOMIC_RELAXED)) {          /* the DJ is teaching us the tab */
@@ -1102,6 +1111,43 @@ static void act_calibrate(void *user)
     __atomic_store_n(&a_calib, 1, __ATOMIC_RELEASE);
     C->banner(MOD_ID, "Close the menu, open Browse, then tap the TAG LIST tab", 6000);
 }
+
+/* ---- the status strip (Diagnostics): which version runs, and what it sees ---------------- */
+static void hud_paint(az_draw *d, az_rect area, void *user)
+{
+    (void) user;
+    static const char *const SCAN[4] = { "not read", "reading", "NO LIBRARY", "ok" };
+    char l1[160], l2[160];
+    int st = clampi(__atomic_load_n(&g_scan_state, __ATOMIC_ACQUIRE), 0, 3);
+    snprintf(l1, sizeof l1, "Smart Track v%s   library: %s   %d tracks   %d playlists   tick %d", MOD_VERSION,
+             SCAN[st], __atomic_load_n(&g_ntracks_pub, __ATOMIC_ACQUIRE),
+             __atomic_load_n(&g_nnames, __ATOMIC_ACQUIRE), __atomic_load_n(&a_ticks, __ATOMIC_RELAXED));
+    int tx = __atomic_load_n(&a_tab_x, __ATOMIC_RELAXED), ty = __atomic_load_n(&a_tab_y, __ATOMIC_RELAXED);
+    char tab[32];
+    if (tx < 0) snprintf(tab, sizeof tab, "not set");
+    else snprintf(tab, sizeof tab, "%d,%d", tx, ty);
+    snprintf(l2, sizeof l2, "tab %s   last touch #%d at %d,%d (screen %d)   overlay %s   knob %s", tab,
+             __atomic_load_n(&a_touch_n, __ATOMIC_RELAXED), __atomic_load_n(&a_touch_x, __ATOMIC_RELAXED),
+             __atomic_load_n(&a_touch_y, __ATOMIC_RELAXED), __atomic_load_n(&a_touch_view, __ATOMIC_RELAXED),
+             __atomic_load_n(&a_active, __ATOMIC_RELAXED) ? "open" : "closed", a_focus ? "OURS" : "not ours");
+    const uint32_t text = C->color(AZ_COL_TEXT), bg = C->color(AZ_COL_BG);
+    C->fill_rect(d, area.x, area.y, area.w, area.h, mix(bg, text, 30));
+    int px = clampi(area.h * 5 / 16, 8, 96);
+    C->draw_text(d, area.x + 8, area.y + 3, l1, px, text);
+    C->draw_text(d, area.x + 8, area.y + 3 + px * 3 / 2, l2, px, text);
+}
+
+static int hud_input(const az_event *ev, void *user)
+{
+    (void) ev;
+    (void) user;
+    return 0;                          /* a status strip: touches go through to EP147 */
+}
+
+static const az_surface_v1 HUD = {
+    .size = sizeof(az_surface_v1), .layer = AZ_LAYER_TOP,
+    .views = AZ_VIEW_BIT(AZ_VIEW_BROWSE), .on_paint = hud_paint, .on_input = hud_input, .user = NULL,
+};
 
 /* ---- the playlist picker page (Mod Menu > Smart Track > Playlists to watch) ------------- */
 static int pk_sel, pk_top, pk_row, pk_list_y, pk_vis = 1;
@@ -1269,7 +1315,7 @@ static int add_rows(void)
     h_overlay = add_row(AZ_ROW_TOGGLE, "overlay", "Smart Track", NULL,
                         "Suggests tracks that fit the playing one.", AZ_ROW_DEFAULT_ON, NULL, 0, 0, NULL, NULL);
     h_open = add_row(AZ_ROW_CHOICE, "open-with", "Open with", "overlay",
-                     "Touching the Tag List tab (calibrate it first), the SMART button, or both.", 0, C_OPEN, 3, 0,
+                     "Touching the Tag List tab (calibrate it first), the SMART button, or both.", 0, C_OPEN, 3, 2,
                      NULL, NULL);
     int h_cal = add_row(AZ_ROW_ACTION, "calibrate", "Calibrate Tag List tab", "overlay",
                         "Then close the menu, open Browse and touch the TAG LIST tab once.", 0, NULL, 0, 0, NULL,
@@ -1295,12 +1341,15 @@ static int add_rows(void)
                      0, C_DECK, 5, 0, NULL, NULL);
     h_usb = add_row(AZ_ROW_CHOICE, "usb", "Search in", NULL, "Which USB ports to suggest tracks from.",
                     0, C_USB, 3, 0, NULL, NULL);
+    h_diag = add_row(AZ_ROW_TOGGLE, "diagnostics", "Status strip", NULL,
+                     "A small strip on Browse: version, library, touches. Turn off once it works.",
+                     AZ_ROW_DEFAULT_ON, NULL, 0, 0, NULL, NULL);
     int h_scan = add_row(AZ_ROW_ACTION, "rescan", "Rescan library", NULL,
                          "Reads the USB library again (after adding tracks or playlists).", 0, NULL, 0, 0, NULL,
                          act_rescan);
     return h_overlay >= 0 && h_open >= 0 && h_cal >= 0 && h_tabw >= 0 && h_otop >= 0 && h_bpm >= 0 &&
            h_bpm_rng >= 0 && h_key >= 0 && h_key_mode >= 0 && h_pl >= 0 && h_pick >= 0 && h_deck >= 0 &&
-           h_usb >= 0 && h_scan >= 0;
+           h_usb >= 0 && h_diag >= 0 && h_scan >= 0;
 }
 
 /* ---- lifecycle -------------------------------------------------------------------------- */
@@ -1339,6 +1388,11 @@ static void tick(void)
 {
     long now = now_ms();
     __atomic_store_n(&a_now_ms, now, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&a_ticks, 1, __ATOMIC_RELAXED);
+    if (!banner_done) {
+        banner_done = 1;
+        C->banner(MOD_ID, "Smart Track " MOD_VERSION " loaded", 3000);
+    }
 
     /* what the touch filter saw: open on the Tag List tab, close on another tab */
     int rq = __atomic_exchange_n(&a_req, 0, __ATOMIC_ACQ_REL);
@@ -1350,7 +1404,7 @@ static void tick(void)
     last_tick_ms = now;
 
     int en = st_row(h_overlay, 1) == 1;
-    int mode = st_row(h_open, 0);                       /* 0 tab, 1 button, 2 both */
+    int mode = st_row(h_open, 2);                       /* 0 tab, 1 button, 2 both */
     __atomic_store_n(&a_tab_on, en && mode != 1, __ATOMIC_RELAXED);
     __atomic_store_n(&a_hw, TAB_HW[clampi(st_row(h_tabw, 1), 0, 2)], __ATOMIC_RELAXED);
     int chip_on = en && (mode != 0 || __atomic_load_n(&a_tab_x, __ATOMIC_RELAXED) < 0);
@@ -1359,6 +1413,25 @@ static void tick(void)
         C->surface_show(chip, chip_on);
     }
     if (!en && __atomic_load_n(&a_active, __ATOMIC_RELAXED)) close_overlay();
+
+    int hud_on = st_row(h_diag, 1) == 1;
+    if (hud_on != last_hud) {
+        last_hud = hud_on;
+        C->surface_show(hud, hud_on);
+    }
+    if (hud_on) {
+        unsigned hs = (unsigned) (__atomic_load_n(&a_ticks, __ATOMIC_RELAXED) / 30);
+        hs = hs * 31u + (unsigned) __atomic_load_n(&g_scan_state, __ATOMIC_RELAXED);
+        hs = hs * 31u + (unsigned) __atomic_load_n(&g_ntracks_pub, __ATOMIC_RELAXED);
+        hs = hs * 31u + (unsigned) __atomic_load_n(&g_nnames, __ATOMIC_RELAXED);
+        hs = hs * 31u + (unsigned) __atomic_load_n(&a_touch_n, __ATOMIC_RELAXED);
+        hs = hs * 31u + (unsigned) __atomic_load_n(&a_active, __ATOMIC_RELAXED);
+        hs = hs * 31u + (unsigned) a_focus + (unsigned) __atomic_load_n(&a_tab_x, __ATOMIC_RELAXED);
+        if (hs != last_hud_sig) {
+            last_hud_sig = hs;
+            C->surface_redraw(hud);
+        }
+    }
 
     if (__atomic_load_n(&a_calib, __ATOMIC_RELAXED) &&
         now - __atomic_load_n(&a_calib_t, __ATOMIC_RELAXED) > 60000)
@@ -1431,13 +1504,16 @@ static int init(const az_core_v1 *core)
 
     ov = C->surface_create(MOD_ID, &OVERLAY);
     chip = C->surface_create(MOD_ID, &CHIP);
-    if (!ov || !chip) {
+    hud = C->surface_create(MOD_ID, &HUD);
+    if (!ov || !chip || !hud) {
         C->log(MOD_ID, "surface_create refused");
         return 4;
     }
     C->surface_place(chip, (az_rect) { CHIP_X, CHIP_Y, CHIP_W, CHIP_H });
     C->surface_show(chip, 1);
     C->surface_show(ov, 0);
+    C->surface_place(hud, (az_rect) { 0, 0, 900, 52 });
+    C->surface_show(hud, 0);                        /* tick shows it when Diagnostics is on */
     ov_place();
     if (C->thread_start(MOD_ID, "smart-scan", worker, NULL) != 0) {
         C->log(MOD_ID, "thread_start refused");
